@@ -1,0 +1,181 @@
+########################################
+
+# Manuel Campagnolo (mlc@isa.ulisboa.pt)
+# September 9, 2019
+########################################
+
+library(dismo) # maxent
+library(sf)
+
+################################## input and main parameters
+FOLDER<-"D:\\valentine-cerrado"
+INPUTNAME<-"example_result_northCerrado_2018_05.gpkg"
+OUTPUTNAME<-"example_result_northCerrado_2018_05_with_mscores.gpkg"
+VARSMAXENT<-c("meanB0","meanB1")
+# constants
+NUMREPETITIONSMAXENT<-3
+MAX.NEGATIVOS <- 10^4; MIN.NEGATIVOS<-1000; MIN.POSITIVOS<-80 ; MAX.POSITIVOS<-10^4
+SIZEGROUPPREDICTMAXENT<-10^6 # partir eventos em bocados se necessário para aplicar predict do modelo MAXENT
+
+#################################### functions
+#
+# calcular rapidamente a mediana dos mscores das NUMREPETITIONSMAXENT repeticoes
+mediana3<-function(v1,v2,v3){
+  (v1<v2 & v2 < v3) * v2+
+    (v1<v3 & v3 < v2) * v3+
+    (v2<v1 & v1 < v3) * v1+
+    (v2<v3 & v3 < v1) * v3+
+    (v3<v1 & v1 < v2) * v1+
+    (v3<v2 & v2 < v1) * v2+
+    (v1==v2 & v2!=v3) * v1+
+    (v1==v3 & v3!=v2) * v1+
+    (v2==v3 & v1!=v3) * v2+
+    (v1==v2 & v2==v3) * v1
+}
+
+# função para criar a amostra "de treino" para MaxEnt
+seleccionar.eventos.treinar.maxent<-function(MAX.NEGATIVOS, MIN.NEGATIVOS, MIN.POSITIVOS,MAX.POSITIVOS, out)
+{
+  # versão anterior: indices.seleccao.negativos.afastados=which(out==0)
+  # definir background:
+  neg<-rep(FALSE,length(out));
+  neg[out==0]<-TRUE # indices.seleccao.negativos.afastados corresdpondem a out==0 (i.e. não são bem background)
+
+  # 10 nov 2017:
+  neg<-rep(TRUE,length(out)); # assim representa o background
+
+  # adicionar ecventos positivos se necessário
+  indpos<-lcpos<-(out==1) #logical
+  if (sum(lcpos)<MIN.POSITIVOS)
+  {
+    nlcpos<-(out==1); #print(sum(nlcpos)) #logical;
+    if (sum(nlcpos)>0) newpos<-sample(which(nlcpos),size=MIN.POSITIVOS-sum(lcpos),replace=TRUE) else newpos<-c() # se a amostra e muito pequena
+    indpos[newpos]<-TRUE #logical
+  }
+  # adicionar eventos negativos de outras classes se necessário
+  indneg<-lcneg<-(neg) #logical # nov 2017: como neg é TRUE, isto equivale a seleccionar os da classe
+  if (sum(lcneg)<MIN.NEGATIVOS)
+  {
+    nlcneg<-(neg) #logical
+    if (sum(nlcneg)>0) newneg<-sample(which(nlcneg),size=MIN.NEGATIVOS-sum(lcneg),replace=TRUE) else newneg<-c()
+    indneg[newneg]<-TRUE
+  }
+  # remover eventos positivos se necessário 20 fev 2017
+  if (sum(lcpos)>MAX.POSITIVOS)
+  {
+newpos<-sample(which(lcpos),size=MAX.POSITIVOS,replace=FALSE)
+    indpos<-rep(FALSE,length(out)); indpos[newpos]<-TRUE
+  }
+  # remover eventos negativos se necessário
+  if (sum(lcneg)>MAX.NEGATIVOS)
+  {
+    # 10 nov 2017: para extrair uma "grid" de background em vez de ser ao acaso (ver paper Elith)
+    # 14 nov 2017: constroi grelha 10 vezes maior e depois extrai apenas MAX.NEGATIVOS (para variar em cada iteração)
+aux<-(which(lcneg))[floor(seq(1,sum(lcneg),length.out=min(sum(lcneg),10*MAX.NEGATIVOS)))]
+    newneg<-sample(aux,size=MAX.NEGATIVOS,replace=FALSE) #sample(which(lcneg),size=MAX.NEGATIVOS,replace=TRUE)
+    indneg<-rep(FALSE,length(out)); indneg[newneg]<-TRUE
+  }
+  # juntar eventos positivos e proporção dos negativos afastados
+seleccaomaxent<-list(idxpos=which(indpos),idxneg=which(indneg))
+  return(seleccaomaxent)
+}
+
+# inputs: eventos, out=coluna de 0 (backgroud) e 1 (positivos)
+treinar.maxent<-function(eventos,out,VARSMAXENT,MAX.NEGATIVOS,MIN.NEGATIVOS, MIN.POSITIVOS, MAX.POSITIVOS,SIZEGROUPPREDICTMAXENT,NUMREPETITIONSMAXENT)
+{
+  modelo<-list()
+  seleccaomaxentlc<-list() # eventos pos e neg usados para treinar maxent em cada classe
+  idxgrupos<-list()
+
+
+  modelo<-list()
+  # nota: indices.seleccao.negativos.afastados <-which(out==0)
+
+  idxthrpos<-which(out==1) # todos os positivos da classe
+  idxthrneg<-sample(which(out==0 ),max(MIN.NEGATIVOS,length(idxthrpos)),replace=TRUE) # amostra dos negativos da classe
+
+  print(paste("Para determinar thresholds: idxthrpos e idxthrneg",length(idxthrpos), length(idxthrneg)))
+
+  # repeticoes para escolher mediana
+  repmscores<-list()
+  seleccaomaxentlc<-list()
+  k<-1
+  for (k in 1:NUMREPETITIONSMAXENT)
+  {
+    print(paste("maxent repetition",k))
+    repmscores[[k]]<-rep(NA,length(out))
+    # seleccionar eventos da tile e dos vizinhos para treinar maxent
+    # 10 nov 2017: agora o output $idxneg corresponde ao background, com selecção de uma amostra de TODOS os eventos do tipo "grid"
+
+seleccaomaxentlc[[k]]<-seleccionar.eventos.treinar.maxent(MAX.NEGATIVOS, MIN.NEGATIVOS, MIN.POSITIVOS,
+MAX.POSITIVOS, out=out)
+
+auxsel<-c(seleccaomaxentlc[[k]]$idxpos,seleccaomaxentlc[[k]]$idxneg)
+    # treino do maxent para a classe lc usando a amostra em vizeventos
+modelc<-dismo::maxent(x=(eventos[auxsel,VARSMAXENT]),p=out[auxsel]) # dismo
+
+    if (FALSE) # ver as isolinhas de mscores
+    {
+      #library(akima)
+      X<-(cbind(eventos[auxsel,VARSMAXENT],out=out[auxsel]))
+      modelc<-maxent(x=X[,VARSMAXENT],p=X$out) # dismo
+      par(mfrow=c(1,1))
+      varx<-VARSMAXENT[1]
+      vary<-VARSMAXENT[2]
+      plot(X[[varx]],X[[vary]],pch="",xlab=varx,ylab=vary)
+      points(X[X$out==1,1],X[X$out==1,2],pch=".")
+      points(X[X$out==0,1],X[X$out==0,2],pch=".",col="red")
+      y<-predict(modelc,X[,VARSMAXENT])
+contour(interp(x=X[[varx]],y=X[[vary]],z=y,duplicate="mean"),add=TRUE,col=rainbow(20))
+    }
+
+    # aplicação de modelc para calcular os mscores apenas para a tile corrente: não para as tiles vizinhas  <<< SÓ PARA EVENTOS
+    modelo[[k]]<-modelc
+    # partir matrix de dados da tile corrente em partes para predict não ser tão pesado # mscores range in [0,1]
+idxgrupos<-rep(seq(1:ceiling(length(out)/SIZEGROUPPREDICTMAXENT)),each=SIZEGROUPPREDICTMAXENT)[1:length(out)]
+repmscores[[k]]<-do.call(c,lapply(split(1:length(out),f=idxgrupos) , function(idx) return(predict(modelc,(eventos[idx,VARSMAXENT])))))
+
+
+  }
+
+  if (FALSE)
+  {
+    print("some statistics about the calculated sets of mscores")
+    for (k in 1:NUMREPETITIONSMAXENT) print(paste("número NA:",sum(is.na(repmscores[[k]]))))
+    for (k in 1:NUMREPETITIONSMAXENT) print(max(repmscores[[k]],na.rm=TRUE))
+    for (k in 1:NUMREPETITIONSMAXENT) {aux<-repmscores[[k]][repmscores[[k]]>quantile(repmscores[[k]],0.95,na.rm=TRUE)];
+    print(paste(max(table(aux)),aux[which.max(table(aux))]))}
+    for (k in 1:NUMREPETITIONSMAXENT) {aux<-repmscores[[k]]; print(length(unique(aux))/length(aux))}
+  }
+
+  if (NUMREPETITIONSMAXENT>1) #
+  {
+    if (NUMREPETITIONSMAXENT!=3) stop("NUMREPETITIONSMAXENT not 3")
+mscores<-mediana3(repmscores[[1]],repmscores[[2]],repmscores[[3]])
+  }
+
+  if (NUMREPETITIONSMAXENT==1) {mscores<-repmscores[[1]]} #; thrvizmscores<-repthrvizmscores[[1]]}
+  return(mscores)
+}
+
+######################################################################################################################
+#
+# Main
+#
+#read data
+X<-st_read(file.path(FOLDER,INPUTNAME))
+X$idx<-1:nrow(X)
+
+# extract data.frame of variables
+eventos<-X; st_geometry(eventos)<-NULL
+eventos<-na.omit(eventos)
+#head(eventos)
+out<-eventos$Fire # positives and background
+
+# compute scores
+mscores<-treinar.maxent(eventos,out,VARSMAXENT,MAX.NEGATIVOS,MIN.NEGATIVOS, MIN.POSITIVOS, MAX.POSITIVOS,SIZEGROUPPREDICTMAXENT,NUMREPETITIONSMAXENT)
+
+# add scores to X (pad with NA)
+X$mscores<-NA; X$mscores[eventos$idx]<-mscores
+
+st_write(X,dsn=file.path(FOLDER,OUTPUTNAME),delete_layer = TRUE) 
